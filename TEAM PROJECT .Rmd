@@ -1,0 +1,347 @@
+---
+title: "PROJECT"
+author: "AJ_TONG"
+date: "3/11/2020"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r}
+# Install packages and read data
+library(pacman,tidyverse)
+p_load(tidyverse,janitor, caret, glmnet, magrittr, 
+       dummies,janitor,rpart.plot,gbm,
+       ggplot2,ggpubr, viridis, reshape2, 
+       cowplot,ranger, pROC, plotROC, dplyr, RColorBrewer,
+       formattable)
+total_df<- read.csv(file="~/Downloads/train-data.csv")
+
+
+#The reason is electric only have 2 oberservations.
+total_df<- subset(total_df, total_df$Fuel_Type != 'Electric')
+# Split the dataset for train and test dataset(20%)
+test_df <- sample_frac(total_df,size=0.2)
+train_df<- setdiff(total_df, test_df)
+total_df<-rbind(train_df,test_df)
+
+# Preprocessing data (-New_Price vairbales, because it contains 86% missing value)
+total<- total_df %>% select(-Price,-X,-New_Price)
+total %>% clean_names()
+total %>% glimpse()
+
+# Data cleaning- categorical and numerical variables
+#Create new Age variable substitute year.
+total_df <- total %>% mutate(Age = 2020-Year) %>% select(-Year)
+total_df$Power<- as.numeric(total_df$Power)
+
+# Milage has two different units, so we need classify accordingly
+# kmpkg will only have values for CNG/LPG cars,
+# kmpl will only have values for Diesel/Petrol cars, then we can create two new variables.
+total_df %<>%
+  mutate(kmpkg = ifelse(Fuel_Type=="CNG" | Fuel_Type=="LPG", Mileage, 0)) %>%
+  mutate(kmpL = ifelse(Fuel_Type=="Diesel" | Fuel_Type=="Petrol", Mileage, 0)) %>%
+  select(-Mileage)
+
+#Select Name only use car brands, instead of car types
+type <- substr(total_df$Name,1,4)
+type
+total_df$Power<- as.numeric(total_df$Power)
+summary(total_df$Power)
+total_df$Name <- type
+total_df <- dummy.data.frame(total_df)
+
+# deal missing value (Seats) & center scale standerlize
+total_m <- preProcess(
+  x = total_df,
+  method = c('medianImpute','center' , 'scale')
+) %>% predict(total_df)
+
+# dummy variables to deal with character variables
+total_d <- dummy.data.frame(total_m)
+
+# Split final clean data
+train_df1 <- head(total_d, 4814)
+test_df1 <- tail(total_d, 1203)
+Price <- train_df$Price
+train_df1 <- cbind(Price, train_df1)
+
+##set seed
+set.seed(19981994)
+
+## Model1: Lasso Regression
+lambdas = 10^seq(from =5, to = -2, length =100)
+train_lasso<- glmnet(
+  x = train_df1 %>% dplyr :: select(-Price) %>% as.matrix(),
+  y = train_df1$Price,
+  standardize = T,
+  alpha = 1,
+  lambda = lambdas
+)
+
+## Cross Validation
+lasso_cv <- cv.glmnet(
+  x = train_df1 %>% dplyr :: select(-Price) %>% as.matrix(),
+  y = train_df1$Price,
+  standardize = T,
+  alpha = 1,
+  lambda = lambdas,
+  ## How we make decisions based on number of folds
+  type.measure = "mse",
+  nfolds = 5
+)
+## Final model for lasso
+final_lasso <- glmnet(
+  x = train_df1 %>% dplyr :: select(-Price) %>% as.matrix(),
+  y = train_df1$Price,
+  standardize = T,
+  alpha = 1,
+  lambda = lasso_cv$lambda.min
+)
+
+## Graph to see the results
+lasso_cv1 <- train(
+  Price ~.,
+  data = train_df1,
+  method = 'glmnet',
+  trControl = trainControl("cv",number = 5),
+  tuneGrid = expand.grid(alpha = 1, lambda = lambdas)
+)
+
+
+min(lasso_cv1$results$RMSE)
+##5.653751
+lasso_cv$lambda.min
+##0.01
+
+## Using the coef function to check the lasso has selected
+coef(final_lasso)
+
+## Make the predition with the lasso model
+lasso_prediction <-predict(
+  final_lasso,
+  type = "response",
+  s = lasso_cv$lambda.min,
+  newx = as.matrix(test_df1)
+)
+
+test_df$lasso_prediction <- lasso_prediction
+lasso_cv1$results
+mean(abs(test_df$Price-test_df$lasso_prediction))
+##2.996764
+min(lasso_cv1$results$RMSE)
+##5.653751
+##max Rsquared: 0.7519921
+min(lasso_cv1$results$MAE)
+##3.054344
+
+
+##graph
+Imp_l <- varImp(lasso_cv1)
+lasso_Imp <- data.frame(variable = names(train_df1 %>% select (-Price)), 
+                        overall = Imp_l$importance$Overall)
+lasso_Imp <- lasso_Imp[order(lasso_Imp$overall, decreasing = TRUE),]
+lasso_Imp_head <- head(lasso_Imp,10)
+
+lasso_Imp_graph <- ggplot(lasso_Imp_head, aes(variable, y = overall,fill = overall))+coord_flip()+
+  geom_col()+
+  theme_light()+scale_fill_distiller(palette = 'Paired')
+
+lasso_Imp_graph
+
+##Model2: Boosting
+boosting <- train(
+  Price~.,
+  data = train_df1,
+  method = 'gbm',
+  trControl = trainControl(
+    method = "cv",
+    number = 5
+  ),
+  tuneGrid = expand.grid(
+    "n.trees" = seq(25,200, by = 25),
+    'interaction.depth'=1:3,
+    'shrinkage'= c(.1,0.01,0.001),
+    'n.minobsinnode'=10
+  )
+)
+
+
+## Make prediction
+boosting_prediction<- predict(
+  boosting,
+  newdata = test_df1
+)
+
+test_df$boosting_prediction <- boosting_prediction
+mean(abs(test_df$Price-test_df$boosting_prediction))
+##1.690242
+boosting$results <- boosting$results[order(boosting$results$RMSE),]
+boosting$results 
+min(boosting$results$RMSE)
+##3.860461
+max(boosting$results$Rsquared)
+##0.8853001
+min(boosting$results$MAE)
+##1.906654
+
+##graph
+
+Imp_b <- varImp(boosting)
+boosting_Imp <- data.frame(variable = names(train_df1 %>% select (-Price)), 
+                           overall = Imp_b$importance$Overall)
+boosting_Imp <- boosting_Imp[order(boosting_Imp$overall, decreasing = TRUE),]
+boosting_Imp_head <- head(boosting_Imp,10)
+
+boosting_Imp_graph <- ggplot(boosting_Imp_head, aes(variable, y = overall,fill = overall))+coord_flip()+
+  geom_col()+
+  theme_light()+scale_fill_distiller(palette = 'Paired')
+
+boosting_Imp_graph
+
+## Model 3: Linear regression
+linear_regression <- train(
+  Price ~.,
+  method = 'lm',
+  data = train_df1,
+  trControl = trainControl(method = "cv", number = 5),
+)
+
+linear_regression$results
+## intercept     RMSE  Rsquared      MAE    RMSESD RsquaredSD     MAESD
+##1      TRUE 5.634924 0.7545236 3.118241 0.6078225 0.02667565 0.1415909
+
+## Make the prediction with linear regression model
+lm_prediction <- predict(linear_regression, newdata = test_df1 )
+
+test_df$lm_prediction <- lm_prediction
+mean(abs(test_df$Price - test_df$lm_prediction))
+##3.01408
+
+## Model 4: Random Forest
+random_forest <- train(
+  Price ~ .,
+  data = train_df1,
+  method = "ranger",
+  num.trees = 100,
+  trControl = trainControl(method = 'oob'),
+  tuneGrid = expand.grid(
+    'mtry' = 2:8,
+    'splitrule' = 'extratrees',
+    'min.node.size' = 1:20
+  )
+)
+
+
+## Make prediction
+randomforest_prediction <- predict(
+  random_forest,
+  newdata = test_df1
+)
+
+## Check the error rate
+test_df$randomforest_prediction <- randomforest_prediction
+mean(abs(test_df$Price - test_df$randomforest_prediction))
+##1.916815
+random_forest$results 
+min(random_forest$results$RMSE)
+##4.473427
+max(random_forest$results$Rsquared)
+##0.8556015
+min(random_forest$results$MAE)
+##2.058779
+
+## Model5: Ridge Regression
+lambdas = 10^seq(from =5, to = -2, length =100)
+train_ridge<- glmnet(
+  x = train_df1 %>% dplyr :: select(-Price) %>% as.matrix(),
+  y = train_df1$Price,
+  standardize = T,
+  alpha = 0,
+  lambda = lambdas
+)
+
+## Cross Validation
+ridge_cv <- cv.glmnet(
+  x = train_df1 %>% dplyr :: select(-Price) %>% as.matrix(),
+  y = train_df1$Price,
+  standardize = T,
+  alpha = 0,
+  lambda = lambdas,
+  ## How we make decisions based on number of folds
+  type.measure = "mse",
+  nfolds = 5
+)
+## Final model for lasso
+final_ridge <- glmnet(
+  x = train_df1 %>% dplyr :: select(-Price) %>% as.matrix(),
+  y = train_df1$Price,
+  standardize = T,
+  alpha = 0,
+  lambda = ridge_cv$lambda.min
+)
+
+## Graph to see the results
+ridge_cv1 <- train(
+  Price ~.,
+  data = train_df1,
+  method = 'glmnet',
+  trControl = trainControl("cv",number = 5),
+  tuneGrid = expand.grid(alpha = 0, lambda = lambdas)
+)
+
+min(ridge_cv1$results$RMSE)
+##5.66239
+ridge_cv$lambda.min
+##0.05094138
+
+## Using the coef function to check the lasso has selected
+coef(final_ridge)
+
+## Make the predition with the ridge model
+ridge_prediction <-predict(
+  final_ridge,
+  type = "response",
+  s = ridge_cv$lambda.min,
+  newx = as.matrix(test_df1)
+)
+
+test_df$ridge_prediction <- ridge_prediction
+mean(abs(test_df$Price-test_df$ridge_prediction))
+##3.00211
+ridge_cv1$results 
+min(ridge_cv1$results$RMSE)
+##5.66239
+##max ridge_cv1$results$Rsquared :0.7533918
+
+min(ridge_cv1$results$MAE)
+##3.013093
+
+
+## Make the table to report the final results
+model <- c('Lasso', 'Boosting', 'Linear regression','Random Forest','Ridge')
+Test_MAE <- c(2.996764,1.690242,3.01408,1.916815,3.00211)
+min_RMSE <- c (5.653751,3.860461,5.634924,4.473427,5.6623)
+max_Rsquared <- c(0.7519921,0.8853001,0.7545236,0.8556015,0.7533918)
+min_MAE <- c(3.054344,1.906654,3.118241,2.058779,3.013093)
+
+
+Final_result <- data.frame(model = model, Test_MAE = Test_MAE, min_RMSE=min_RMSE,
+                           max_Rsquared=max_Rsquared, min_MAE=min_MAE 
+                           )
+
+formattable(Final_result, align =c("l","c","c","c","c"), list(
+  `model` = formatter("span", style = ~ style(color = "grey",font.weight = "bold")), 
+  `Test_MAE`= color_tile("pink", "gray"),
+  `min_RMSE`= color_tile("pink", "gray"),
+  `max_Rsquared`= color_tile("gray", "pink"),
+  `min_MAE`= color_tile("pink", "gray")))
+
+graph_results <- melt(Final_result)
+ggplot (graph_results, aes(model, value, fill= variable))+
+  geom_bar(stat="identity",position="dodge")+theme_light()+coord_flip()+
+  scale_fill_viridis(discrete = T)
+
+
+```
+
